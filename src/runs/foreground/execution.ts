@@ -153,6 +153,10 @@ async function runSingleAttempt(
 		mcpDirectTools: agent.mcpDirectTools,
 		promptFileStem: agent.name,
 		intercomSessionName: options.intercomSessionName,
+		orchestratorIntercomTarget: options.orchestratorIntercomTarget,
+		runId: options.runId,
+		childAgentName: agent.name,
+		childIndex: options.index ?? 0,
 	});
 
 	const result: SingleResult = {
@@ -417,7 +421,7 @@ async function runSingleAttempt(
 				const toolArgs = evt.args && typeof evt.args === "object" && !Array.isArray(evt.args)
 					? evt.args as Record<string, unknown>
 					: {};
-				if (options.allowIntercomDetach && evt.toolName === "intercom") {
+				if (options.allowIntercomDetach && (evt.toolName === "intercom" || evt.toolName === "contact_supervisor")) {
 					intercomStarted = true;
 				}
 				progress.toolCount++;
@@ -629,7 +633,10 @@ async function runSingleAttempt(
 		return result;
 	}
 
-	if (exitCode === 0 && !result.error) {
+	if (result.error && result.exitCode === 0) {
+		result.exitCode = 1;
+	}
+	if (result.exitCode === 0 && !result.error) {
 		const errInfo = detectSubagentError(result.messages);
 		if (errInfo.hasError) {
 			result.exitCode = errInfo.exitCode ?? 1;
@@ -742,7 +749,6 @@ export async function runSync(
 
 	const shareEnabled = options.share === true;
 	const sessionEnabled = Boolean(options.sessionFile || options.sessionDir) || shareEnabled;
-	const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
 	const skillNames = options.skills ?? agent.skills ?? [];
 	const skillCwd = options.cwd ?? runtimeCwd;
 	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(skillNames, skillCwd, runtimeCwd);
@@ -793,6 +799,7 @@ export async function runSync(
 	for (let i = 0; i < modelsToTry.length; i++) {
 		const candidate = modelsToTry[i];
 		if (candidate) attemptedModels.push(candidate);
+		const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
 		const result = await runSingleAttempt(runtimeCwd, agent, task, candidate, options, {
 			sessionEnabled,
 			systemPrompt,
@@ -807,15 +814,16 @@ export async function runSync(
 		sumUsage(aggregateUsage, result.usage);
 		totalToolCount += result.progressSummary?.toolCount ?? 0;
 		totalDurationMs += result.progressSummary?.durationMs ?? 0;
+		const attemptSucceeded = result.exitCode === 0 && !result.error;
 		const attempt: ModelAttempt = {
 			model: candidate ?? result.model ?? agent.model ?? "default",
-			success: result.exitCode === 0,
+			success: attemptSucceeded,
 			exitCode: result.exitCode,
 			error: result.error,
 			usage: { ...result.usage },
 		};
 		modelAttempts.push(attempt);
-		if (result.exitCode === 0) {
+		if (attemptSucceeded) {
 			break;
 		}
 		if (!isRetryableModelFailure(result.error) || i === modelsToTry.length - 1) {

@@ -12,7 +12,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { applyThinkingSuffix } from "../shared/pi-args.ts";
 import { injectSingleOutputInstruction, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
-import { buildChainInstructions, isParallelStep, resolveStepBehavior, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
+import { buildChainInstructions, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import type { RunnerStep } from "../shared/parallel-utils.ts";
 import { resolvePiPackageRoot } from "../shared/pi-spawn.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
@@ -65,6 +65,7 @@ interface AsyncExecutionContext {
 
 interface AsyncChainParams {
 	chain: ChainStep[];
+	task?: string;
 	resultMode?: Exclude<SubagentRunMode, "single">;
 	agents: AgentConfig[];
 	ctx: AsyncExecutionContext;
@@ -114,6 +115,16 @@ interface AsyncExecutionResult {
 	content: Array<{ type: "text"; text: string }>;
 	details: Details;
 	isError?: boolean;
+}
+
+export function formatAsyncStartedMessage(headline: string): string {
+	return [
+		headline,
+		"",
+		"The async run is detached. Do not run sleep timers or polling loops just to wait for it.",
+		"If you have independent work, continue that work. If you have nothing else to do until the async result arrives, end your turn now; Pi will deliver the completion when the run finishes.",
+		"Use subagent({ action: \"status\", id: \"...\" }) when you need the current status/result, or to inspect a blocked/stale run. Do not poll just to wait.",
+	].join("\n");
 }
 
 /**
@@ -203,6 +214,10 @@ export function executeAsyncChain(
 	const chainSkills = params.chainSkills ?? [];
 	const availableModels = params.availableModels;
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
+	const firstStep = chain[0];
+	const originalTask = params.task ?? (firstStep
+		? (isParallelStep(firstStep) ? firstStep.parallel[0]?.task : (firstStep as SequentialStep).task)
+		: undefined);
 
 	for (const s of chain) {
 		const stepAgents = isParallelStep(s)
@@ -247,7 +262,7 @@ export function executeAsyncChain(
 		const a = agents.find((x) => x.name === s.agent)!;
 		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
 		const instructionCwd = behaviorCwd ?? stepCwd;
-		const behavior = resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills);
+		const behavior = suppressProgressForReadOnlyTask(resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
 		const skillNames = behavior.skills === false ? [] : behavior.skills;
 		const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(skillNames, stepCwd, ctx.cwd);
 		if (missingSkills.includes("pi-subagents")) throw new UnavailableSubagentSkillError(UNAVAILABLE_SUBAGENT_SKILL_ERROR);
@@ -304,7 +319,7 @@ export function executeAsyncChain(
 			if (isParallelStep(s)) {
 				const parallelBehaviors = s.parallel.map((task) => {
 					const agent = agents.find((candidate) => candidate.name === task.agent)!;
-					return resolveStepBehavior(agent, buildStepOverrides(task), chainSkills);
+					return suppressProgressForReadOnlyTask(resolveStepBehavior(agent, buildStepOverrides(task), chainSkills), task.task, originalTask);
 				});
 				const progressPrecreated = parallelBehaviors.some((behavior) => behavior.progress);
 				if (progressPrecreated) {
@@ -425,8 +440,8 @@ export function executeAsyncChain(
 		.join(" -> ");
 
 	return {
-		content: [{ type: "text", text: `Async ${resultMode}: ${chainDesc} [${id}]` }],
-		details: { mode: resultMode, results: [], asyncId: id, asyncDir },
+		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`) }],
+		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir },
 	};
 }
 
@@ -557,7 +572,7 @@ export function executeAsyncSingle(
 	}
 
 	return {
-		content: [{ type: "text", text: `Async: ${agent} [${id}]` }],
-		details: { mode: "single", results: [], asyncId: id, asyncDir },
+		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`) }],
+		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir },
 	};
 }

@@ -211,7 +211,7 @@ The package includes reusable prompt templates for common workflows. You do not 
 pi install npm:pi-intercom
 ```
 
-Most users do not call `intercom` directly. After `pi-intercom` is installed, `pi-subagents` can automatically give child agents a private coordination channel back to the parent session.
+Most users do not call `intercom` directly. After `pi-intercom` is installed, `pi-subagents` can automatically give child agents a private coordination channel back to the parent session. The bridge recognizes the normal `pi install npm:pi-intercom` package install as well as legacy local extension checkouts.
 
 Use it for work where the child might need a decision instead of guessing:
 
@@ -223,10 +223,9 @@ Run this implementation in the background. If the worker gets blocked or needs a
 Ask oracle to review this plan. If it sees a decision I need to make, have it ask me instead of assuming.
 ```
 
-The child can use two kinds of coordination messages:
+The child can use one dedicated coordination tool:
 
-- `ask`: the child needs a decision or clarification from the parent session
-- `send`: the child sends a short update when blocked or explicitly asked for progress
+- `contact_supervisor`: the child contacts the parent/supervisor session that delegated the task. Use `reason: "need_decision"` for blocking decisions or clarification, and `reason: "progress_update"` for short non-blocking updates when a discovery changes the plan. Do not ask for clarification when the only conflict is review-only/no-edit versus progress-writing or artifact-writing instructions; no-edit wins.
 
 Child-side routine completion handoffs are still not expected. With the intercom bridge active, parent-side `pi-subagents` sends grouped completion results through `pi-intercom`: one grouped message per foreground parent `subagent` run and one per completed async result file. Acknowledged foreground delivery returns a compact receipt with artifact/session paths; if unacknowledged, the normal full output is preserved. Grouped messages include child intercom targets and full child summaries.
 
@@ -333,6 +332,8 @@ You can combine them in either order:
 /run reviewer "review this diff" --bg --fork
 ```
 
+Background runs are detached. If the parent agent has other independent work, it should keep working. If it has nothing useful to do until the background result arrives, it should end the turn instead of running sleep or status-polling loops. Pi will deliver the completion when the run finishes.
+
 The `oracle` and `worker` builtins are designed for an explicit decision loop. A typical pattern is to ask `oracle` for diagnosis and a recommended execution prompt, then only run `worker` after the main agent approves that direction.
 
 ## Clarify and launch UI
@@ -402,7 +403,7 @@ Agent locations, lowest to highest priority:
 | User | `~/.pi/agent/agents/**/*.md` |
 | Project | `.pi/agents/**/*.md` |
 
-Project discovery also reads legacy `.agents/**/*.md` files. Nested subdirectories are discovered recursively. `.chain.md` files are treated as chains, not agents. If both `.agents/` and `.pi/agents/` define the same parsed runtime agent name, `.pi/agents/` wins. Use `agentScope: "user" | "project" | "both"` to control discovery; `both` is the default and project definitions win runtime-name collisions.
+Project discovery also reads legacy `.agents/**/*.md` files. Nested subdirectories are discovered recursively. `.chain.md` files do not define agents. If both `.agents/` and `.pi/agents/` define the same parsed runtime agent name, `.pi/agents/` wins. Use `agentScope: "user" | "project" | "both"` to control discovery; `both` is the default and project definitions win runtime-name collisions.
 
 Builtin agents load at the lowest priority, so a user or project agent with the same name overrides them. They do not pin a provider model; they inherit your current Pi default model unless you set `subagents.agentOverrides.<name>.model`. `oracle` is an advisory reviewer that critiques direction and proposes an execution prompt without editing files. `worker` is the implementation agent for normal tasks and approved oracle handoffs.
 
@@ -532,14 +533,14 @@ When `extensions` is present, it takes precedence over extension paths implied b
 
 ## Chain files
 
-Chains are reusable `.chain.md` workflows stored next to agent files.
+Chains are reusable `.chain.md` workflows stored separately from agent files.
 
 | Scope | Path |
 |-------|------|
-| User | `~/.pi/agent/agents/**/*.chain.md` |
-| Project | `.pi/agents/**/*.chain.md` |
+| User | `~/.pi/agent/chains/**/*.chain.md` |
+| Project | `.pi/chains/**/*.chain.md` |
 
-Project discovery also reads legacy `.agents/**/*.chain.md` files. Nested subdirectories are discovered recursively. If both locations define the same parsed runtime chain name, `.pi/agents/` wins. Chains support the same optional `package` frontmatter as agents; `name: review-flow` plus `package: code-analysis` runs as `code-analysis.review-flow`.
+Nested subdirectories are discovered recursively. If user and project scopes define the same parsed runtime chain name, the project chain wins. Chains support the same optional `package` frontmatter as agents; `name: review-flow` plus `package: code-analysis` runs as `code-analysis.review-flow`.
 
 Example:
 
@@ -779,11 +780,12 @@ Status and control actions:
 subagent({ action: "status" })
 subagent({ action: "status", id: "<run-id>" })
 subagent({ action: "interrupt", id: "<run-id>" })
-subagent({ action: "resume", id: "<async-run-id>", message: "follow-up question" })
+subagent({ action: "resume", id: "<run-id>", message: "follow-up question" })
+subagent({ action: "resume", id: "<run-id>", index: 1, message: "follow-up for child 2" })
 subagent({ action: "doctor" })
 ```
 
-`resume` sends the follow-up directly when the async child is still reachable over intercom. After completion, it starts a new async child from the stored single-child session file.
+`resume` sends the follow-up directly when an async child is still reachable over intercom. After completion, it revives the child by starting a new async child from the stored child session file. Multi-child async runs and remembered foreground single, parallel, or chain runs can be revived by passing `index` to choose the child. Revive starts a new child process from the old session context; it does not restart the same OS process, and it requires the chosen child to have a persisted `.jsonl` session file.
 
 ## Worktree isolation
 
@@ -887,16 +889,16 @@ Sets the `/agents` list shortcut for opening the new agent/chain template picker
 }
 ```
 
-Controls whether subagents receive runtime intercom coordination instructions and whether `intercom` is auto-added to their tool allowlist when needed.
+Controls whether subagents receive runtime intercom coordination instructions and whether `intercom` and `contact_supervisor` are auto-added to their tool allowlist when needed.
 
 Fields:
 
 - `mode`: default `always`; use `fork-only` to inject only for forked runs, or `off` to disable the bridge.
 - `instructionFile`: optional Markdown template replacing the default bridge instructions. `{orchestratorTarget}` is interpolated. Relative paths resolve from `~/.pi/agent/extensions/subagent/`.
 
-Bridge activation also requires `pi-intercom` to be installed and enabled, a targetable current session name or fallback alias, and `pi-intercom` in any explicit agent `extensions` allowlist.
+Bridge activation also requires `pi-intercom` to be installed and enabled through `pi install npm:pi-intercom` or a legacy local extension checkout, a targetable current session name or fallback alias, and `pi-intercom` in any explicit agent `extensions` allowlist.
 
-The default injected guidance tells children to use intercom only for coordination: ask when blocked or needing a decision, send updates only when blocked or explicitly asked, and avoid routine completion handoffs.
+The default injected guidance tells children to use `contact_supervisor` with `reason: "need_decision"` when blocked or needing a decision, `reason: "progress_update"` only for meaningful blocked/progress updates, generic `intercom` as fallback plumbing, and avoid routine completion handoffs.
 
 ### `worktreeSetupHook`
 

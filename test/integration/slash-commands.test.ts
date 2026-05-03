@@ -158,6 +158,7 @@ function createCommandContext(
 		custom: (...args: unknown[]) => Promise<unknown>;
 		notify: (message: string, type?: string) => void;
 		setStatus: (key: string, text: string | undefined) => void;
+		setToolsExpanded: (expanded: boolean) => void;
 		sessionManager: unknown;
 	}> = {},
 ) {
@@ -167,6 +168,7 @@ function createCommandContext(
 		ui: {
 			notify: overrides.notify ?? ((_message: string) => {}),
 			setStatus: overrides.setStatus ?? ((_key: string, _text: string | undefined) => {}),
+			setToolsExpanded: overrides.setToolsExpanded ?? ((_expanded: boolean) => {}),
 			onTerminalInput: () => () => {},
 			custom: overrides.custom ?? (async () => undefined),
 		},
@@ -181,6 +183,7 @@ function createCommandContext(
 async function withTempProject<T>(prefix: string, fn: (root: string) => Promise<T>): Promise<T> {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	fs.mkdirSync(path.join(root, ".pi", "agents"), { recursive: true });
+	fs.mkdirSync(path.join(root, ".pi", "chains"), { recursive: true });
 	try {
 		return await fn(root);
 	} finally {
@@ -189,7 +192,7 @@ async function withTempProject<T>(prefix: string, fn: (root: string) => Promise<
 }
 
 function writeProjectChain(root: string, fileName: string, content: string): void {
-	fs.writeFileSync(path.join(root, ".pi", "agents", fileName), content, "utf-8");
+	fs.writeFileSync(path.join(root, ".pi", "chains", fileName), content, "utf-8");
 }
 
 async function captureSlashCommandParams(
@@ -346,6 +349,40 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		assert.ok(visibleDetails);
 		const visibleSnapshot = getSlashRenderableSnapshot!(visibleDetails!);
 		assert.equal((visibleSnapshot.result.content[0] as { text?: string }).text, "Scout finished");
+	});
+
+	it("/run collapses tool detail before showing the initial live card", async () => {
+		const log: string[] = [];
+		const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
+		const events = createEventBus();
+		events.on(SLASH_SUBAGENT_REQUEST_EVENT, (data) => {
+			const requestId = (data as { requestId: string }).requestId;
+			events.emit(SLASH_SUBAGENT_STARTED_EVENT, { requestId });
+			events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, {
+				requestId,
+				result: { content: [{ type: "text", text: "done" }], details: { mode: "single", results: [] } },
+				isError: false,
+			});
+		});
+
+		const pi = {
+			events,
+			registerCommand(name: string, spec: { handler(args: string, ctx: unknown): Promise<void> }) {
+				commands.set(name, spec);
+			},
+			registerShortcut() {},
+			sendMessage() {
+				log.push("send");
+			},
+		};
+
+		registerSlashCommands!(pi, createState(process.cwd()));
+		await commands.get("run")!.handler("scout inspect this", createCommandContext({
+			hasUI: true,
+			setToolsExpanded: (expanded) => log.push(`expanded:${String(expanded)}`),
+		}));
+
+		assert.deepEqual(log.slice(0, 2), ["expanded:false", "send"]);
 	});
 
 	it("/run finalizes the slash snapshot before the last UI redraw on error", async () => {
@@ -711,9 +748,9 @@ Project chain task
 `);
 
 			const { params } = await captureSlashCommandParams("run-chain", "review-flow -- Shared task", root, () => {
-				const userAgentsDir = path.join(os.homedir(), ".agents");
-				fs.mkdirSync(userAgentsDir, { recursive: true });
-				fs.writeFileSync(path.join(userAgentsDir, "review-flow.chain.md"), `---
+				const userChainsDir = path.join(os.homedir(), ".pi", "agent", "chains");
+				fs.mkdirSync(userChainsDir, { recursive: true });
+				fs.writeFileSync(path.join(userChainsDir, "review-flow.chain.md"), `---
 name: review-flow
 description: User review flow
 ---

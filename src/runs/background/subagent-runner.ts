@@ -7,7 +7,7 @@ import type { Message } from "@mariozechner/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
-import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput } from "../shared/single-output.ts";
+import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	type ActivityState,
 	type ArtifactConfig,
@@ -100,6 +100,7 @@ interface StepResult {
 	error?: string;
 	success: boolean;
 	skipped?: boolean;
+	sessionFile?: string;
 	intercomTarget?: string;
 	model?: string;
 	attemptedModels?: string[];
@@ -140,6 +141,25 @@ function tokenUsageFromAttempts(attempts: ModelAttempt[] | undefined): TokenUsag
 	}
 	const total = input + output;
 	return total > 0 ? { input, output, total } : null;
+}
+
+function appendRecentStepOutput(step: RunnerStatusStep, lines: string[]): void {
+	const nonEmpty = lines.filter((line) => line.trim());
+	if (nonEmpty.length === 0) return;
+	step.recentOutput ??= [];
+	step.recentOutput.push(...nonEmpty);
+	if (step.recentOutput.length > 50) {
+		step.recentOutput.splice(0, step.recentOutput.length - 50);
+	}
+}
+
+function resetStepLiveDetail(step: RunnerStatusStep): void {
+	step.currentTool = undefined;
+	step.currentToolArgs = undefined;
+	step.currentToolStartedAt = undefined;
+	step.currentPath = undefined;
+	step.recentTools = [];
+	step.recentOutput = [];
 }
 
 interface ChildEventContext {
@@ -538,6 +558,7 @@ interface SingleStepContext {
 	piArgv1?: string;
 	registerInterrupt?: (interrupt: (() => void) | undefined) => void;
 	childIntercomTarget?: string;
+	orchestratorIntercomTarget?: string;
 	onChildEvent?: (event: ChildEvent) => void;
 }
 
@@ -555,6 +576,7 @@ async function runSingleStep(
 	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
 	interrupted?: boolean;
+	sessionFile?: string;
 	intercomTarget?: string;
 	completionGuardTriggered?: boolean;
 }> {
@@ -562,7 +584,6 @@ async function runSingleStep(
 	const task = step.task.replace(placeholderRegex, () => ctx.previousOutput);
 	const sessionEnabled = Boolean(step.sessionFile) || ctx.sessionEnabled;
 	const sessionDir = step.sessionFile ? undefined : ctx.sessionDir;
-	const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
 
 	let artifactPaths: ArtifactPaths | undefined;
 	if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false) {
@@ -584,10 +605,12 @@ async function runSingleStep(
 	const attemptNotes: string[] = [];
 	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
 	let finalResult: RunPiStreamingResult | undefined;
+	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
 	let completionGuardTriggeredFinal = false;
 
 	for (let index = 0; index < candidates.length; index++) {
 		const candidate = candidates[index];
+		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
 		const { args, env, tempDir } = buildPiArgs({
 			baseArgs: ["--mode", "json", "-p"],
 			task,
@@ -604,6 +627,10 @@ async function runSingleStep(
 			mcpDirectTools: step.mcpDirectTools,
 			promptFileStem: step.agent,
 			intercomSessionName: ctx.childIntercomTarget,
+			orchestratorIntercomTarget: ctx.orchestratorIntercomTarget,
+			runId: ctx.id,
+			childAgentName: step.agent,
+			childIndex: ctx.flatIndex,
 		});
 		const run = await runPiStreaming(
 			args,
@@ -635,7 +662,9 @@ async function runSingleStep(
 			? 1
 			: hiddenError?.hasError
 				? (hiddenError.exitCode ?? 1)
-				: run.exitCode;
+				: run.error && run.exitCode === 0
+					? 1
+					: run.exitCode;
 		const error = completionGuardError
 			?? (hiddenError?.hasError
 				? hiddenError.details
@@ -652,6 +681,7 @@ async function runSingleStep(
 		modelAttempts.push(attempt);
 		if (candidate) attemptedModels.push(candidate);
 		completionGuardTriggeredFinal = completionGuardTriggered;
+		finalOutputSnapshot = outputSnapshot;
 		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error };
 		if (attempt.success || completionGuardTriggered) break;
 		if (!isRetryableModelFailure(error) || index === candidates.length - 1) break;
@@ -660,7 +690,7 @@ async function runSingleStep(
 
 	const rawOutput = finalResult?.finalOutput ?? "";
 	const resolvedOutput = step.outputPath && finalResult?.exitCode === 0
-		? resolveSingleOutput(step.outputPath, rawOutput, outputSnapshot)
+		? resolveSingleOutput(step.outputPath, rawOutput, finalOutputSnapshot)
 		: { fullOutput: rawOutput };
 	const output = resolvedOutput.fullOutput;
 	const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, output) : undefined;
@@ -707,6 +737,7 @@ async function runSingleStep(
 		output: outputForSummary,
 		exitCode: finalResult?.exitCode ?? 1,
 		error: finalResult?.error,
+		sessionFile: step.sessionFile,
 		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
 		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
@@ -756,7 +787,7 @@ function markParallelGroupSetupFailure(input: {
 		input.statusPayload.steps[flatTaskIndex].endedAt = input.failedAt;
 		input.statusPayload.steps[flatTaskIndex].durationMs = 0;
 		input.statusPayload.steps[flatTaskIndex].exitCode = 1;
-		input.results.push({ agent: input.group.parallel[taskIndex].agent, output: input.setupError, success: false });
+		input.results.push({ agent: input.group.parallel[taskIndex].agent, output: input.setupError, success: false, sessionFile: input.group.parallel[taskIndex].sessionFile });
 	}
 	input.statusPayload.currentStep = input.groupStartFlatIndex;
 	input.statusPayload.lastUpdate = input.failedAt;
@@ -892,9 +923,12 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		steps: flatSteps.map((step) => ({
 			agent: step.agent,
 			status: "pending",
+			...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
 			skills: step.skills,
 			model: step.model,
 			attemptedModels: step.modelCandidates && step.modelCandidates.length > 0 ? step.modelCandidates : step.model ? [step.model] : undefined,
+			recentTools: [],
+			recentOutput: [],
 		})),
 		artifactsDir,
 		sessionDir: config.sessionDir,
@@ -997,13 +1031,19 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			const currentPath = resolveCurrentPath(event.toolName, event.args);
 			step.toolCount = (step.toolCount ?? 0) + 1;
 			step.currentTool = event.toolName;
+			step.currentToolArgs = extractToolArgsPreview(event.args ?? {});
 			step.currentToolStartedAt = now;
 			step.currentPath = currentPath;
 			pendingToolResults[flatIndex] = { tool: event.toolName, path: currentPath, mutates, startedAt: now };
 			statusPayload.toolCount = (statusPayload.toolCount ?? 0) + 1;
 			syncTopLevelCurrentTool();
 		} else if (event.type === "tool_execution_end") {
+			if (step.currentTool) {
+				step.recentTools ??= [];
+				step.recentTools.push({ tool: step.currentTool, args: step.currentToolArgs || "", endMs: now });
+			}
 			step.currentTool = undefined;
+			step.currentToolArgs = undefined;
 			step.currentToolStartedAt = undefined;
 			step.currentPath = undefined;
 			syncTopLevelCurrentTool();
@@ -1011,6 +1051,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			const toolSnapshot = pendingToolResults[flatIndex];
 			pendingToolResults[flatIndex] = undefined;
 			const resultText = extractTextFromContent(event.message.content);
+			appendRecentStepOutput(step, resultText.split("\n").slice(-10));
 			if (toolSnapshot?.mutates && didMutatingToolFail(resultText)) {
 				const state = mutatingFailureStates[flatIndex]!;
 				recordMutatingFailure(state, {
@@ -1046,6 +1087,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				resetMutatingFailureState(mutatingFailureStates[flatIndex]!);
 			}
 		} else if (event.type === "message_end" && event.message?.role === "assistant") {
+			appendRecentStepOutput(step, extractTextFromContent(event.message.content).split("\n").slice(-10));
 			step.turnCount = (step.turnCount ?? 0) + 1;
 			const usage = event.message.usage;
 			if (usage) {
@@ -1272,6 +1314,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						statusPayload.steps[fi].status = "running";
 						statusPayload.steps[fi].error = undefined;
 						statusPayload.steps[fi].activityState = undefined;
+						resetStepLiveDetail(statusPayload.steps[fi]);
 						statusPayload.steps[fi].startedAt = taskStartTime;
 						statusPayload.steps[fi].endedAt = undefined;
 						statusPayload.steps[fi].durationMs = undefined;
@@ -1299,6 +1342,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							piPackageRoot: config.piPackageRoot,
 							piArgv1: config.piArgv1,
 							childIntercomTarget: config.childIntercomTargets?.[fi],
+							orchestratorIntercomTarget: config.controlIntercomTarget,
 							registerInterrupt: (interrupt) => {
 								activeChildInterrupt = interrupt;
 							},
@@ -1373,6 +1417,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						error: pr.error,
 						success: pr.exitCode === 0,
 						skipped: pr.skipped,
+						sessionFile: pr.sessionFile,
 						intercomTarget: pr.intercomTarget,
 						model: pr.model,
 						attemptedModels: pr.attemptedModels,
@@ -1414,6 +1459,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.steps[flatIndex].status = "running";
 			statusPayload.steps[flatIndex].activityState = undefined;
 			statusPayload.activityState = undefined;
+			resetStepLiveDetail(statusPayload.steps[flatIndex]);
 			statusPayload.steps[flatIndex].skills = seqStep.skills;
 			statusPayload.steps[flatIndex].startedAt = stepStartTime;
 			statusPayload.steps[flatIndex].lastActivityAt = stepStartTime;
@@ -1439,6 +1485,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				piPackageRoot: config.piPackageRoot,
 				piArgv1: config.piArgv1,
 				childIntercomTarget: config.childIntercomTargets?.[flatIndex],
+				orchestratorIntercomTarget: config.controlIntercomTarget,
 				registerInterrupt: (interrupt) => {
 					activeChildInterrupt = interrupt;
 				},
@@ -1454,6 +1501,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				output: singleResult.output,
 				error: singleResult.error,
 				success: singleResult.exitCode === 0,
+				sessionFile: singleResult.sessionFile,
 				intercomTarget: singleResult.intercomTarget,
 				model: singleResult.model,
 				attemptedModels: singleResult.attemptedModels,
@@ -1542,9 +1590,12 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		}
 	}
 
+	const resultMode = config.resultMode ?? statusPayload.mode;
 	const agentName = flatSteps.length === 1
 		? flatSteps[0].agent
-		: `chain:${flatSteps.map((s) => s.agent).join("->")}`;
+		: resultMode === "parallel"
+			? `parallel:${flatSteps.map((s) => s.agent).join("+")}`
+			: `chain:${flatSteps.map((s) => s.agent).join("->")}`;
 	let sessionFile: string | undefined;
 	let shareUrl: string | undefined;
 	let gistUrl: string | undefined;
@@ -1629,7 +1680,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		writeAtomicJson(resultPath, {
 			id,
 			agent: agentName,
-			mode: config.resultMode ?? statusPayload.mode,
+			mode: resultMode,
 			success: !interrupted && results.every((r) => r.success),
 			state: interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed",
 			summary: interrupted ? "Paused after interrupt. Waiting for explicit next action." : summary,
@@ -1639,6 +1690,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				error: r.error,
 				success: r.success,
 				skipped: r.skipped || undefined,
+				sessionFile: r.sessionFile,
 				intercomTarget: r.intercomTarget,
 				model: r.model,
 				attemptedModels: r.attemptedModels,

@@ -25,7 +25,6 @@ interface DoctorDeps {
 	discoverAgentsAll: typeof discoverAgentsAll;
 	discoverAvailableSkills: typeof discoverAvailableSkills;
 	diagnoseIntercomBridge: typeof diagnoseIntercomBridge;
-	getAllTools: () => { name: string }[];
 }
 
 interface DoctorReportInput {
@@ -55,7 +54,6 @@ const DEFAULT_DEPS: DoctorDeps = {
 	discoverAgentsAll,
 	discoverAvailableSkills,
 	diagnoseIntercomBridge,
-	getAllTools: () => [],
 };
 
 function errorText(error: unknown): string {
@@ -158,7 +156,7 @@ function formatIntercomDiagnostic(diagnostic: IntercomBridgeDiagnostic, context:
 		`- bridge: ${diagnostic.active ? "active" : "inactive"}${diagnostic.reason ? ` (${diagnostic.reason})` : ""}`,
 		`- mode: ${diagnostic.mode}; context: ${context ?? "unspecified"}`,
 		`- orchestrator target: ${diagnostic.orchestratorTarget ?? "not available"}`,
-		`- pi-intercom: ${diagnostic.piIntercomAvailable ? "available" : "not loaded"}`,
+		`- pi-intercom: ${diagnostic.piIntercomAvailable ? "available" : "unavailable"} at ${diagnostic.extensionDir}`,
 	];
 	if (diagnostic.configPath && diagnostic.intercomConfigEnabled !== undefined) {
 		lines.push(`- intercom config: ${diagnostic.intercomConfigEnabled === false ? "disabled" : "enabled or absent"} (${diagnostic.configPath})`);
@@ -194,7 +192,7 @@ export function buildDoctorReport(input: DoctorReportInput): string {
 			config: input.config.intercomBridge,
 			context: input.context,
 			orchestratorTarget: input.orchestratorTarget,
-			hasIntercom: () => deps.getAllTools().some((t) => t.name === "intercom"),
+			cwd: input.cwd,
 		}), input.context).join("\n")).split("\n"),
 	];
 	return lines.join("\n");

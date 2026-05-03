@@ -105,7 +105,7 @@ Use this at the start of non-trivial work. Launch `scout` for local context and 
 
 ### Parallel cleanup technique
 
-Use this after implementation when the user wants cleanup review or when a final pass would reduce AI-slop. Launch two fresh-context `reviewer` tasks with `output: false`: one deslop pass and one verbosity pass. If the `deslop` or `verbosity-cleaner` skills are available, pass the relevant skill to that reviewer; otherwise inline the criteria. Both reviewers are review-only and should flag concrete issues with severity, file/line references, and smallest safe fixes. The parent decides what to apply and asks before making changes unless cleanup was already authorized.
+Use this after implementation when the user wants cleanup review or when a final pass would reduce AI-slop. Launch two fresh-context `reviewer` tasks with `output: false` and `progress: false`: one deslop pass and one verbosity pass. If the `deslop` or `verbosity-cleaner` skills are available, pass the relevant skill to that reviewer; otherwise inline the criteria. Both reviewers are review-only and should flag concrete issues with severity, file/line references, and smallest safe fixes. Review-only/no-edit beats progress-writing or artifact-writing instructions. The parent decides what to apply and asks before making changes unless cleanup was already authorized.
 
 ## Builtin Agents
 
@@ -183,11 +183,10 @@ Agent files can live in:
 - legacy `.agents/**/*.md` — still read for compatibility, but `.pi/agents/` wins on conflicts
 
 Chains live in:
-- `~/.pi/agent/agents/**/*.chain.md`
-- `.pi/agents/**/*.chain.md`
-- legacy `.agents/**/*.chain.md`
+- `~/.pi/agent/chains/**/*.chain.md` — user scope
+- `.pi/chains/**/*.chain.md` — project scope
 
-Discovery is recursive. `.chain.md` files are chains, not agents. Agents and chains can set optional frontmatter `package: code-analysis`; `name: scout` plus `package: code-analysis` registers as runtime name `code-analysis.scout` while serialization keeps `name` and `package` separate.
+Discovery is recursive. `.chain.md` files do not define agents. Agents and chains can set optional frontmatter `package: code-analysis`; `name: scout` plus `package: code-analysis` registers as runtime name `code-analysis.scout` while serialization keeps `name` and `package` separate.
 
 Precedence is by parsed runtime name:
 1. project scope
@@ -263,7 +262,9 @@ without forcing each step to rediscover everything.
 
 ### Async/background
 
-Use async mode whenever the parent agent should keep working while a child runs. A normal foreground `subagent(...)` call blocks the parent until the child completes; it is appropriate when the next parent step depends on the child result. If you say you will "ask a reviewer while I continue auditing" or otherwise run local work in parallel with a child, launch with `async: true`. Do not end your turn immediately after launching that async child if you promised to keep working; continue the local inspection or other independent work, then check the async run when its result is needed.
+Use async mode whenever the parent agent should keep working while a child runs. A normal foreground `subagent(...)` call blocks the parent until the child completes; it is appropriate when the next parent step depends on the child result. If you say you will "ask a reviewer while I continue auditing" or otherwise run local work in parallel with a child, launch with `async: true`.
+
+Do not end your turn immediately after launching an async child if you promised to keep working. Continue the local inspection or other independent work, then check the async run when its result is needed. If there is no independent work left and you would only be running `sleep` or status polling commands to wait, end your turn instead. Pi will deliver the async completion when it arrives.
 
 ```typescript
 subagent({
@@ -288,6 +289,21 @@ const run = subagent({
 ```
 
 Inspect async runs with `subagent({ action: "status", id: "..." })`, `subagent({ action: "status" })` for active runs, or the `/subagents-status` slash command.
+
+Use `resume` for follow-up work after a delegated run:
+
+```typescript
+subagent({ action: "resume", id: "run-id", message: "Follow up on this point." })
+subagent({ action: "resume", id: "run-id", index: 1, message: "Continue reviewer 2." })
+```
+
+Resume behavior:
+- If an async child is still running and reachable, `resume` sends the follow-up to that live child over intercom.
+- If an async child has completed, `resume` revives it by starting a new async child from the persisted child session file.
+- Multi-child async runs require `index` unless only one running child is selectable.
+- Completed foreground single, parallel, and chain runs can also be revived by `index` while their run metadata remains in extension state.
+- Revive starts a new child process from the old session context; it does not restart the same OS process.
+- If the chosen child has no persisted `.jsonl` session file, resume fails and reports that directly.
 
 Use diagnostics when setup or child startup looks wrong:
 
@@ -375,7 +391,7 @@ prefer a single-writer pattern instead.
 The intended oracle loop is:
 1. the main agent forks to `oracle`
 2. `oracle` reviews direction, drift, assumptions, and risks
-3. `oracle` can coordinate back to the orchestrator via `intercom`
+3. `oracle` can coordinate back through `contact_supervisor` when the bridge injects it
 4. the main agent decides what direction to approve
 5. only then should `worker` implement
 
@@ -401,25 +417,30 @@ history as a baseline contract.
 
 `pi-subagents` works without `pi-intercom`. When `pi-intercom` is installed and enabled, the intercom bridge can automatically give child agents a private coordination channel back to the parent session.
 
-Most agents should not call `intercom` directly unless bridge instructions provide a target. Do not invent a target. Use the target from the injected bridge instructions or from a visible needs-attention notice.
+Most agents should not call generic `intercom` directly unless bridge instructions provide a target and `contact_supervisor` is unavailable. Do not invent a target. Prefer the tool from the injected bridge instructions.
 
-Use `intercom` when:
+Use `contact_supervisor` with `reason: "need_decision"` when:
 - a subagent is blocked on a decision
 - a child needs clarification instead of guessing
-- a detached or async child needs to coordinate without waiting for normal tool return flow
-- an advisory agent was explicitly asked to send a concise progress update
+- an approval, product, API, or scope choice is required before continuing safely
+
+Do not use `contact_supervisor` just to resolve review-only/no-edit versus progress-writing or artifact-writing instructions. No-edit wins, and the child should return review findings without touching files.
+
+Use `contact_supervisor` with `reason: "progress_update"` when:
+- a child is explicitly asked for progress
+- a meaningful discovery changes the plan
+- a long-running child needs to report a blocked/progress checkpoint without waiting for normal tool return flow
 
 Message conventions:
-- `ask` means the child needs a decision or clarification from the parent session.
-- `send` means a short blocked/progress update, only when blocked or explicitly asked.
+- `reason: "need_decision"` waits for the parent reply and returns it to the child.
+- `reason: "progress_update"` is non-blocking and should stay concise.
 - Child-side routine completion handoffs are not expected. With the intercom bridge active, parent-side `pi-subagents` sends grouped completion results through `pi-intercom`: one grouped message per foreground parent run and one per completed async result file. Acknowledged foreground delivery returns a compact receipt with artifact/session paths; if unacknowledged, the normal full output is preserved. Grouped messages include child intercom targets and full child summaries.
 
-If a bridge target is available, a child can ask:
+If bridge instructions provide the child-facing tool, a child can ask:
 
 ```typescript
-intercom({
-  action: "ask",
-  to: "<bridge-provided-target>",
+contact_supervisor({
+  reason: "need_decision",
   message: "Should I optimize for readability or performance here?"
 })
 ```
